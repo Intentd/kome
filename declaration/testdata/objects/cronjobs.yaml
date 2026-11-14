@@ -1,0 +1,14 @@
+apiVersion: batch.example.com/v1
+kind: CronJob
+metadata: {name: nightly, namespace: default}
+spec: {replicas: 2, schedule: "0 1 * * *", typo: x}
+---
+apiVersion: batch.example.com/v1
+kind: CronJob
+metadata: {name: nightly, namespace: default}
+spec: {replicas: 3}
+---
+apiVersion: config.example.com/v1
+kind: AppConfig
+metadata: {name: wrong, namespace: default}
+spec: {}

@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 262" role="img" aria-label="A migration's lifecycle: kome up moves objects from the old shape to the new one and records what they held; kome down restores them and leaves drift alone; kome clean removes the record and makes the migration final">
+  <style>
+    .box { fill: #F5F8FE; stroke: #326CE5; stroke-width: 1.5; }
+    .final { fill: #326CE5; stroke: #326CE5; stroke-width: 1.5; }
+    .title { fill: #14213D; font: 700 12px ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif; letter-spacing: 1.2px; }
+    .final-title { fill: #FFFFFF; font: 700 12px ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif; letter-spacing: 1.2px; }
+    .code { fill: #14213D; font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .final-code { fill: #FFFFFF; font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .note { fill: #5B6475; font: 11px ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif; }
+    .final-note { fill: #DCE6FB; font: 11px ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif; }
+    .cmd { fill: #326CE5; font: 700 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .arrow { fill: none; stroke: #326CE5; stroke-width: 2; }
+    .back { fill: none; stroke: #326CE5; stroke-width: 2; stroke-dasharray: 5 5; }
+    .head { fill: #326CE5; }
+    @media (prefers-color-scheme: dark) {
+      .box { fill: #16213A; stroke: #6E9BF5; }
+      .final { fill: #2D5BC4; stroke: #6E9BF5; }
+      .title, .code { fill: #F0F3F6; }
+      .note { fill: #A3ACBA; }
+      .cmd { fill: #8FB2F7; }
+      .arrow, .back { stroke: #6E9BF5; }
+      .head { fill: #6E9BF5; }
+    }
+  </style>
+
+  <!-- 1. The old shape -->
+  <rect class="box" x="20" y="94" width="180" height="90" rx="10"/>
+  <text class="title" x="36" y="120">OLD SHAPE</text>
+  <text class="code" x="36" y="144">replicas: 3</text>
+  <text class="note" x="36" y="168">under from.schema</text>
+
+  <!-- 2. Migrated, with the record -->
+  <rect class="box" x="270" y="94" width="180" height="90" rx="10"/>
+  <text class="title" x="286" y="120">MIGRATED</text>
+  <text class="code" x="286" y="144">scaling.min: 3</text>
+  <text class="note" x="286" y="168">+ record of what it held</text>
+
+  <!-- 3. Final -->
+  <rect class="final" x="520" y="94" width="180" height="90" rx="10"/>
+  <text class="final-title" x="536" y="120">FINAL</text>
+  <text class="final-code" x="536" y="144">scaling.min: 3</text>
+  <text class="final-note" x="536" y="168">under to.schema, no record</text>
+
+  <!-- up: old → migrated, over the top -->
+  <path class="arrow" d="M110 90 C110 46 360 46 360 84"/>
+  <polygon class="head" points="360,92 354,80 366,80"/>
+  <text class="cmd" x="235" y="18" text-anchor="middle">kome up</text>
+  <text class="note" x="235" y="34" text-anchor="middle">needs the transitional schema</text>
+
+  <!-- down: migrated → old, underneath -->
+  <path class="back" d="M360 188 C360 230 110 230 110 196"/>
+  <polygon class="head" points="110,188 104,200 116,200"/>
+  <text class="cmd" x="235" y="242" text-anchor="middle">kome down</text>
+  <text class="note" x="235" y="257" text-anchor="middle">restores; leaves edits alone</text>
+
+  <!-- clean: migrated → final -->
+  <path class="arrow" d="M454 139 L508 139"/>
+  <polygon class="head" points="516,139 504,133 504,145"/>
+  <text class="cmd" x="485" y="128" text-anchor="middle">clean</text>
+</svg>
