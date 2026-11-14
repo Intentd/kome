@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 96" role="img" aria-label="KOME, the Kubernetes Object Migration Engine">
+  <style>
+    .old { fill: none; stroke: #326CE5; stroke-width: 3; stroke-linejoin: round; }
+    .new { fill: #326CE5; }
+    .up { fill: none; stroke: #326CE5; stroke-width: 3; stroke-linecap: round; }
+    .down { fill: none; stroke: #326CE5; stroke-width: 3; stroke-linecap: round; stroke-dasharray: 1 6; }
+    .head { fill: #326CE5; }
+    .wordmark { fill: #14213D; }
+    .subtitle { fill: #5B6475; }
+    @media (prefers-color-scheme: dark) {
+      .old, .up, .down { stroke: #6E9BF5; }
+      .new, .head { fill: #6E9BF5; }
+      .wordmark { fill: #F0F3F6; }
+      .subtitle { fill: #A3ACBA; }
+    }
+  </style>
+
+  <!-- Mark: a Kubernetes object (heptagon) moving from its old shape (outline)
+       to its new one (filled): up above, and down, dotted, back below -->
+  <g transform="translate(16 24)">
+    <polygon class="old" transform="translate(14 24)" points="0.00,-12.00 9.38,-7.48 11.70,2.67 5.21,10.81 -5.21,10.81 -11.70,2.67 -9.38,-7.48"/>
+    <polygon class="new" transform="translate(80 24)" points="0.00,-12.00 9.38,-7.48 11.70,2.67 5.21,10.81 -5.21,10.81 -11.70,2.67 -9.38,-7.48"/>
+    <path class="up" d="M24 10 Q47 -6 64 8"/>
+    <polygon class="head" points="70,12 59.5,11.5 66,3"/>
+    <path class="down" d="M70 38 Q47 54 30 40"/>
+    <polygon class="head" points="24,36 34.5,36.5 28,45"/>
+  </g>
+
+  <!-- Wordmark -->
+  <text class="wordmark" x="128" y="54"
+        font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
+        font-size="40" font-weight="700" letter-spacing="3">KOME</text>
+  <text class="subtitle" x="130" y="74"
+        font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
+        font-size="10.5" font-weight="600" letter-spacing="1.2">KUBERNETES OBJECT MIGRATION ENGINE</text>
+</svg>

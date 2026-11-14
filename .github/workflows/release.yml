@@ -1,0 +1,157 @@
+name: Release
+
+# A v*.*.* tag builds kome for every platform, signs the checksums keyless
+# with cosign (the identity install.sh checks), publishes the GitHub release
+# (a pre-release for tags with "-", such as v0.1.0-rc.1), and, for a stable
+# tag, writes Formula/kome.rb in intentd/homebrew-tap.
+#
+# Needs the repository secret HOMEBREW_TAP_TOKEN: a token that can push to
+# intentd/homebrew-tap.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}_${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build and package
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          bin=kome
+          [ "$GOOS" = windows ] && bin=kome.exe
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w \
+            -X github.com/intentd/tools/version.Version=${GITHUB_REF_kome} \
+            -X github.com/intentd/tools/version.Commit=${GITHUB_SHA} \
+            -X github.com/intentd/tools/version.Date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o "dist/$bin" ./cmd/kome
+          tar -czf "dist/kome_${GOOS}_${GOARCH}.tar.gz" -C dist "$bin" -C "$GITHUB_WORKSPACE" README.md LICENSE
+          if [ "$GOOS" = windows ]; then
+            (cd dist && zip -j "kome_${GOOS}_${GOARCH}.zip" "$bin")
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kome_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Sign and release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write   # keyless cosign: this workflow's identity signs
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: sigstore/cosign-installer@v3
+      - name: Checksums and signature
+        working-directory: dist
+        run: |
+          sha256sum kome_*.tar.gz kome_*.zip > checksums.txt
+          cosign sign-blob --yes --bundle checksums.txt.sigstore.json checksums.txt
+          cosign verify-blob checksums.txt --bundle checksums.txt.sigstore.json \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          sha256sum -c checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/kome_*.tar.gz
+            dist/kome_*.zip
+            dist/checksums.txt
+            dist/checksums.txt.sigstore.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: dist/checksums.txt
+
+  homebrew:
+    name: Homebrew formula
+    needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: intentd/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+      - uses: actions/download-artifact@v4
+        with:
+          name: checksums
+      - name: Write Formula/kome.rb
+        run: |
+          sha() { grep " kome_$1.tar.gz\$" checksums.txt | cut -d' ' -f1; }
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_kome}"
+          cat > homebrew-tap/Formula/kome.rb <<EOF
+          class Kome < Formula
+            desc "Migrate stored Kubernetes objects between schemas, reversibly"
+            homepage "https://github.com/${GITHUB_REPOSITORY}"
+            version "${GITHUB_REF_kome#v}"
+            license "Apache-2.0"
+            on_macos do
+              on_arm do
+                url "${base}/kome_darwin_arm64.tar.gz"
+                sha256 "$(sha darwin_arm64)"
+              end
+              on_intel do
+                url "${base}/kome_darwin_amd64.tar.gz"
+                sha256 "$(sha darwin_amd64)"
+              end
+            end
+            on_linux do
+              on_arm do
+                url "${base}/kome_linux_arm64.tar.gz"
+                sha256 "$(sha linux_arm64)"
+              end
+              on_intel do
+                url "${base}/kome_linux_amd64.tar.gz"
+                sha256 "$(sha linux_amd64)"
+              end
+            end
+            def install
+              bin.install "kome"
+            end
+            test do
+              system "#{bin}/kome", "version"
+            end
+          end
+          EOF
+      - name: Commit and push
+        working-directory: homebrew-tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/kome.rb
+          git commit -m "kome ${GITHUB_REF_kome}"
+          git push
