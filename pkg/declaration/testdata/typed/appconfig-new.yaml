@@ -1,0 +1,21 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata: {name: newconfigs.config.example.com}
+spec:
+  group: config.example.com
+  scope: Namespaced
+  names: {kind: NewConfig, plural: newconfigs}
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                image: {type: string}
+                replicas: {type: integer}
+                extra: {type: string}
