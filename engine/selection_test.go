@@ -46,3 +46,7 @@ func TestAnnotations(t *testing.T) {
 	assert.True(t, a.IsTooling("kubectl.kubernetes.io/last-applied-configuration"))
 	assert.False(t, a.IsTooling("example.com/note"))
 }
+
+func TestKubeCheck(t *testing.T) {
+	assert.ErrorContains(t, engine.Kube{}.Check(), "build it with ForConfig")
+}

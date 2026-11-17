@@ -317,11 +317,11 @@ func edited(v any, s *apiextensionsv1.JSONSchemaProps) any {
 // when it cannot be read.
 func (mr *migrationRun) liveSchema(ctx context.Context, gvk schema.GroupVersionKind, path string) *apiextensionsv1.JSONSchemaProps {
 	kc := mr.Engine.Kube
-	m, err := kc.RESTMapper().RESTMapping(gvk.GroupKind(), gvk.Version)
+	m, err := kc.Mapping(gvk)
 	if err != nil {
 		return nil
 	}
-	crd, err := kube.GetCRD(ctx, kc.DynamicClient(), m.Resource.Resource+"."+gvk.Group)
+	crd, err := kube.GetCRD(ctx, kc.Dynamic(), m.Resource.Resource+"."+gvk.Group)
 	if err != nil {
 		return nil
 	}

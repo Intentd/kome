@@ -65,7 +65,10 @@ migrations:
       when:
         - field: status.phase
           equals: Ready
-    prune: true
+    lifecycle:
+      prune: true
+      children: reparent
+      finalizers: [example.io/cleanup]
 `)
 	assert.Equal(t, []string{"appconfig", "cronjob"}, f.Names())
 	cron, app := f.Migrations["cronjob"], f.Migrations["appconfig"]
@@ -87,7 +90,7 @@ migrations:
 
 	errs, warns := messages(f.Validate())
 	assert.Empty(t, errs)
-	assert.Contains(t, warns, "appconfig.prune: deletes each source")
+	assert.Contains(t, warns, "appconfig.lifecycle.prune: deletes each source")
 }
 
 func TestLoad_UnknownKeys(t *testing.T) {
@@ -122,7 +125,7 @@ migrations:
     from: {schema: ./schemas/cronjob-old.yaml}
     to: {schema: ./schemas/cronjob.yaml, copyStatus: true, namespace: x}
     spec: {replicas: {to: scaling.min}}
-    prune: true
+    lifecycle: {prune: true}
   kind-with-transitional:
     from: {schema: ./schemas/appconfig.yaml}
     transitional: {schema: ./schemas/appconfig.yaml}
@@ -143,7 +146,7 @@ migrations:
 		"conversion.spec: to is the same kind with no spec moves",
 		"field-with-kind-keys.to.copyStatus: applies to kind moves",
 		"field-with-kind-keys.to.namespace: applies to kind moves",
-		"field-with-kind-keys.prune: applies to kind moves",
+		"field-with-kind-keys.lifecycle: applies to kind moves",
 		"kind-with-transitional.transitional: applies to field moves",
 		"missing-to.to: needs a schema, or apiVersion and kind",
 		"not-a-crd.from: schema ./kome.yaml: expected kind: CustomResourceDefinition",
@@ -222,18 +225,57 @@ migrations:
     from: {schema: ./schemas/appconfig.yaml}
     to: {schema: ./schemas/newconfig.yaml}
 `)
-	assert.NoError(t, f.Set("appconfig", "prune=true"))
+	assert.NoError(t, f.Set("appconfig", "lifecycle.prune=true"))
 	assert.NoError(t, f.Set("appconfig", "selection.namespaces=[default, staging]"))
 	assert.NoError(t, f.Set("appconfig", "to.copyStatus=true"))
 	m := f.Migrations["appconfig"]
-	assert.True(t, m.Prune)
+	assert.True(t, m.Lifecycle.Prune)
 	assert.True(t, m.To.CopyStatus)
 	assert.Equal(t, []string{"default", "staging"}, m.Selection.Namespaces)
 
 	assert.ErrorContains(t, f.Set("appconfig", "prnue=true"), "prnue")
-	assert.ErrorContains(t, f.Set("appconfig", "prune=maybe"), "prune")
-	assert.ErrorContains(t, f.Set("nope", "prune=true"), `no migration "nope"`)
-	assert.ErrorContains(t, f.Set("appconfig", "prune"), "want key=value")
+	assert.ErrorContains(t, f.Set("appconfig", "lifecycle.prune=maybe"), "lifecycle.prune")
+	assert.ErrorContains(t, f.Set("nope", "lifecycle.prune=true"), `no migration "nope"`)
+	assert.ErrorContains(t, f.Set("appconfig", "lifecycle.prune"), "want key=value")
+}
+
+func TestValidate_Lifecycle(t *testing.T) {
+	f := load(t, `
+migrations:
+  no-prune:
+    from: {schema: ./schemas/appconfig.yaml}
+    to: {schema: ./schemas/newconfig.yaml}
+    lifecycle: {children: reparent, finalizers: [example.io/cleanup]}
+  bad-policy:
+    from: {schema: ./schemas/appconfig.yaml}
+    to: {schema: ./schemas/newconfig.yaml}
+    lifecycle: {prune: true, children: adopt}
+  system-finalizers:
+    from: {schema: ./schemas/appconfig.yaml}
+    to: {schema: ./schemas/newconfig.yaml}
+    lifecycle:
+      prune: true
+      finalizers: [kubernetes.io/pvc-protection, foregroundDeletion, orphan, example.io/x, example.io/x, "not a name"]
+  fine:
+    from: {schema: ./schemas/appconfig.yaml}
+    to: {schema: ./schemas/newconfig.yaml}
+    lifecycle: {prune: true, children: orphan, finalizers: [example.io/cleanup]}
+`)
+	errs, warns := messages(f.Validate())
+	for _, want := range []string{
+		"no-prune.lifecycle.children: applies when pruning; set lifecycle.prune",
+		"no-prune.lifecycle.finalizers: applies when pruning; set lifecycle.prune",
+		`bad-policy.lifecycle.children: "adopt": one of reparent, orphan, delete`,
+		`system-finalizers.lifecycle.finalizers: "kubernetes.io/pvc-protection" belongs to Kubernetes and is never removed`,
+		`system-finalizers.lifecycle.finalizers: "foregroundDeletion" belongs to Kubernetes`,
+		`system-finalizers.lifecycle.finalizers: "orphan" belongs to Kubernetes`,
+		`system-finalizers.lifecycle.finalizers: "example.io/x" is listed twice`,
+		`system-finalizers.lifecycle.finalizers: "not a name"`,
+	} {
+		assert.Contains(t, errs, want)
+	}
+	assert.NotContains(t, errs, "fine.", "a valid lifecycle has no errors")
+	assert.Contains(t, warns, "fine.lifecycle.prune: deletes each source once its destination holds every source field; dry-run lists the children and finalizers")
 }
 
 func TestValidate_OverlappingWrites(t *testing.T) {
@@ -251,4 +293,85 @@ migrations:
 	errs, _ := messages(f.Validate())
 	assert.Contains(t, errs, `cronjob.spec.timeout: writes "timeout", which overlaps "timeout" written by spec.schedule`)
 	assert.Contains(t, errs, `cronjob.spec.b: writes "scaling.min", which overlaps "scaling" written by spec.a`)
+}
+
+func TestValidate_FieldManager(t *testing.T) {
+	f := load(t, `
+migrations:
+  too-long:
+    from: {schema: ./schemas/appconfig.yaml}
+    to: {schema: ./schemas/newconfig.yaml}
+    fieldManager: `+strings.Repeat("m", 129)+`
+  unprintable:
+    from: {schema: ./schemas/appconfig.yaml}
+    to: {schema: ./schemas/newconfig.yaml}
+    fieldManager: "operator\u0007"
+  fine:
+    from: {schema: ./schemas/appconfig.yaml}
+    to: {schema: ./schemas/newconfig.yaml}
+    fieldManager: appconfig-operator
+`)
+	errs, _ := messages(f.Validate())
+	assert.Contains(t, errs, "too-long.fieldManager:")
+	assert.Contains(t, errs, "unprintable.fieldManager:")
+	assert.NotContains(t, errs, "fine.fieldManager")
+}
+
+func TestValidate_TemplatesAndCEL(t *testing.T) {
+	f := load(t, `
+migrations:
+  cronjob:
+    from: {schema: ./schemas/cronjob-old.yaml}
+    to: {schema: ./schemas/cronjob.yaml}
+    spec:
+      replicas: {to: scaling.min, value: '${ value * 2 }'}
+      timeout: {from: timeoutSeconds, to: timeout, value: '{{ printf "%ds" .value }}'}
+      image: {value: 'nginx'}
+      legacy: {value: '{{ conditionsState .value "x" }}'}
+      schedule: {value: '${ conditionsState(value, "x") }'}
+  appconfig:
+    from: {schema: ./schemas/appconfig.yaml}
+    to:
+      schema: ./schemas/newconfig.yaml
+      metadata:
+        labels: {from: '{{ name . }}', bad: '{{ name }}'}
+`)
+	errs, _ := messages(f.Validate())
+	for _, want := range []string{
+		"cronjob.spec.legacy.value:",
+		"conditionsState takes 1 argument, got 2",
+		"cronjob.spec.schedule.value:",
+		"appconfig.to.metadata.labels.bad:",
+		"name takes 1 argument, got 0",
+	} {
+		assert.Contains(t, errs, want)
+	}
+	for _, fine := range []string{"spec.replicas", "spec.timeout:", "spec.image", "labels.from"} {
+		assert.NotContains(t, errs, fine)
+	}
+}
+
+func TestOrderAndNeeds(t *testing.T) {
+	f := load(t, `
+migrations:
+  c: {from: {schema: ./schemas/appconfig.yaml}, to: {schema: ./schemas/newconfig.yaml}, needs: [b]}
+  a: {from: {schema: ./schemas/appconfig.yaml}, to: {schema: ./schemas/newconfig.yaml}, needs: [c]}
+  b: {from: {schema: ./schemas/appconfig.yaml}, to: {schema: ./schemas/newconfig.yaml}}
+  z: {from: {schema: ./schemas/appconfig.yaml}, to: {schema: ./schemas/newconfig.yaml}}
+`)
+	order, err := f.Order()
+	require.NoError(t, err)
+	assert.Equal(t, []string{"b", "c", "a", "z"}, order, "each after what it needs; names otherwise")
+
+	f = load(t, `
+migrations:
+  a: {from: {schema: ./schemas/appconfig.yaml}, to: {schema: ./schemas/newconfig.yaml}, needs: [b]}
+  b: {from: {schema: ./schemas/appconfig.yaml}, to: {schema: ./schemas/newconfig.yaml}, needs: [a]}
+  self: {from: {schema: ./schemas/appconfig.yaml}, to: {schema: ./schemas/newconfig.yaml}, needs: [self]}
+  lost: {from: {schema: ./schemas/appconfig.yaml}, to: {schema: ./schemas/newconfig.yaml}, needs: [nowhere]}
+`)
+	errs, _ := messages(f.Validate())
+	assert.Contains(t, errs, "needs form a cycle: a → b → a")
+	assert.Contains(t, errs, "self.needs: a migration can't need itself")
+	assert.Contains(t, errs, `lost.needs: "nowhere" is not a migration in the file`)
 }

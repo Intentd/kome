@@ -18,9 +18,12 @@ func (mg migrator) down(ctx context.Context, obj *unstructured.Unstructured, res
 	if obj.GetAnnotations()[mg.Annotations.FieldSnapshot] == "" {
 		return nil, nil, nil, nil
 	}
-	record, err := mg.record(obj)
+	all, record, err := mg.record(obj)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	if len(record) == 0 {
+		return nil, nil, nil, nil // another migration's record only
 	}
 	spec, _, _ := unstructured.NestedMap(obj.Object, "spec")
 	if spec == nil {
@@ -31,6 +34,7 @@ func (mg migrator) down(ctx context.Context, obj *unstructured.Unstructured, res
 		remaining[k] = v
 	}
 	patchSpec := map[string]any{}
+	manager := mg.FieldManager
 	for _, m := range mg.moves {
 		raw, ok := record[m.From]
 		if !ok {
@@ -55,16 +59,24 @@ func (mg migrator) down(ctx context.Context, obj *unstructured.Unstructured, res
 		}
 		restored = append(restored, m.Key)
 		delete(remaining, m.From)
+		// Undo as the manager that made the move, even if the file changed since.
+		if fm, _ := raw.(map[string]any)["fieldManager"].(string); fm != "" {
+			manager = fm
+		}
 	}
 	if len(restored) == 0 {
 		return nil, driftedMoves, nil, nil
 	}
 
 	ann := map[string]any{}
-	if len(remaining) == 0 {
-		ann[mg.Annotations.FieldSnapshot], ann[mg.Annotations.Timestamp] = nil, nil
+	rest := mg.withMine(all, remaining)
+	if len(rest) == 0 {
+		ann[mg.Annotations.FieldSnapshot] = nil
+		if _, kindRecord := obj.GetAnnotations()[mg.Annotations.KindSnapshot]; !kindRecord {
+			ann[mg.Annotations.Timestamp] = nil
+		}
 	} else {
-		encoded, err := engine.EncodeRecord(remaining, mg.Annotations.FieldSnapshot, obj.GetAnnotations())
+		encoded, err := engine.EncodeRecord(rest, mg.Annotations.FieldSnapshot, obj.GetAnnotations())
 		if err != nil {
 			return nil, driftedMoves, nil, err
 		}
@@ -76,7 +88,7 @@ func (mg migrator) down(ctx context.Context, obj *unstructured.Unstructured, res
 		"metadata":   engine.Meta(obj, ann, true),
 		"spec":       patchSpec,
 	}
-	if err := mg.Patch(ctx, resource, obj, patch); err != nil {
+	if err := mg.WithFieldManager(manager, mg.Apply).Patch(ctx, resource, obj, patch); err != nil {
 		return restored, driftedMoves, spec, fmt.Errorf("apply the restore: %w", err)
 	}
 	return restored, driftedMoves, spec, nil

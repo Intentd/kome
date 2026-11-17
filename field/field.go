@@ -7,6 +7,7 @@ package field
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -94,7 +95,8 @@ func Run(ctx context.Context, r *engine.Runner, t Transformer, m Migration, scop
 	if err != nil {
 		return result, err
 	}
-	mg := migrator{Runner: r, t: t, moves: m.Moves}
+	mg := migrator{Runner: r, name: m.Name, t: t, moves: m.Moves}
+	owners := engine.OwnerTally{}
 	var strictErrs []string
 	for i := range items {
 		r.Report(m.Name, i+1, len(items))
@@ -103,17 +105,29 @@ func Run(ctx context.Context, r *engine.Runner, t Transformer, m Migration, scop
 			result.Objects = append(result.Objects, engine.ObjectResult{Namespace: obj.GetNamespace(), Name: obj.GetName(), Skipped: true, Excluded: true})
 			continue
 		}
+		if r.Mode == engine.Up {
+			for _, mv := range m.Moves {
+				owners.Add(obj, "spec."+mv.From, r.FieldManager)
+			}
+		}
 		res, strictErr := mg.process(ctx, obj, resource)
 		result.Objects = append(result.Objects, res)
 		if strictErr != "" {
 			strictErrs = append(strictErrs, strictErr)
 		}
 	}
+	// Whoever wrote the old path will write it again: a GitOps tool applying
+	// manifests that still have the old shape, a Helm release, a script.
+	owners.Each(func(path, manager string, n int) {
+		warn(fmt.Sprintf("%s is written by %s on %s: it still has the old shape and will set it again; update it too",
+			path, manager, engine.Objects(n, "object")))
+	})
 	return result, engine.StrictError(strictErrs)
 }
 
 type migrator struct {
 	*engine.Runner
+	name  string // the migration's, which keys its entries in the record
 	t     Transformer
 	moves Moves
 }
@@ -144,7 +158,7 @@ func (mg migrator) process(ctx context.Context, obj *unstructured.Unstructured, 
 		res.Fields, res.AfterSpec = changed, after
 	}
 	if err != nil {
-		res.Err = err
+		res.Err, res.TooLarge = err, errors.Is(err, engine.ErrTooLarge)
 		if mg.Strict {
 			return res, fmt.Sprintf("%s: %s", engine.ObjRef(obj), err)
 		}

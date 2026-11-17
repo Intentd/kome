@@ -27,8 +27,14 @@ type Migration struct {
 	Labels, Annotations map[string]string
 	PreserveSource      bool
 	CopyStatus          bool
-	Prune               bool
-	Selection           engine.Selection
+	// Prune deletes each source once its destination holds every source
+	// field. Children is what happens to the objects it owns: "reparent",
+	// "orphan", "delete", or "" (a source with children is then not pruned).
+	// Finalizers are the only finalizers it may remove first.
+	Prune      bool
+	Children   string
+	Finalizers []string
+	Selection  engine.Selection
 }
 
 // Run runs m in r's mode, scoped by scope.
@@ -71,16 +77,29 @@ func Run(ctx context.Context, r *engine.Runner, m Migration, scope engine.Select
 		return result, err
 	}
 
-	mg := &migrator{Runner: r, m: m, sel: sel, dstResource: dstResource, dstCluster: dstCluster, claimed: map[string]string{}}
+	mg := &migrator{Runner: r, m: m, sel: sel, dstResource: dstResource, dstCluster: dstCluster, claimed: map[string]string{}, warn: warn}
+	owners := engine.OwnerTally{}
 	var strictErrs []string
 	for i := range items {
 		r.Report(m.Name, i+1, len(items))
+		if r.Mode == engine.Up && mg.Admits(sel, &items[i]) {
+			owners.Add(&items[i], "spec", r.FieldManager)
+		}
 		res, strictErr := mg.process(ctx, &items[i])
 		result.Objects = append(result.Objects, res)
 		if strictErr != "" {
 			strictErrs = append(strictErrs, strictErr)
 		}
 	}
+	// Whoever wrote the sources will write them again: a GitOps tool applying
+	// manifests of the old kind, a Helm release, a script.
+	owners.Each(func(_, manager string, n int) {
+		w := fmt.Sprintf("%s objects are written by %s (%s): it still writes the old kind", m.From.Kind, manager, engine.Objects(n, "source"))
+		if m.Prune {
+			w += " and will recreate what the prune deletes"
+		}
+		warn(w + "; move it to " + m.To.Kind + " too")
+	})
 	return result, engine.StrictError(strictErrs)
 }
 
@@ -93,6 +112,17 @@ type migrator struct {
 	// claimed maps each destination this run writes (or would) to its
 	// source, so two sources landing on one name fail even in a dry-run.
 	claimed map[string]string
+	// owned indexes the objects that own-reference others, built once per
+	// run when a prune needs to find a source's children (see prune.go).
+	owned *ownerIndex
+	warn  func(string)
+}
+
+// as returns a copy of mg writing as fm.
+func (mg *migrator) as(fm string) *migrator {
+	out := *mg
+	out.Runner = mg.Runner.WithFieldManager(fm, mg.Apply)
+	return &out
 }
 
 func (mg *migrator) process(ctx context.Context, obj *unstructured.Unstructured) (engine.ObjectResult, string) {

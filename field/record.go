@@ -9,16 +9,38 @@ import (
 	"github.com/intentd/tools/structured"
 )
 
-// record decodes obj's field record; empty when there is none. A record
-// that cannot be decoded fails the object rather than being overwritten.
-func (mg migrator) record(obj *unstructured.Unstructured) (map[string]any, error) {
-	out := map[string]any{}
+// record decodes obj's field record: every field migration's entries, keyed
+// by migration name, then by the moved path. mine is this migration's,
+// empty when it has none. Keying by migration lets two migrations move the
+// same path (A → B, then B → C) and be undone one at a time. A record that
+// cannot be decoded fails the object rather than being overwritten.
+func (mg migrator) record(obj *unstructured.Unstructured) (all, mine map[string]any, err error) {
+	all = map[string]any{}
 	if raw := obj.GetAnnotations()[mg.Annotations.FieldSnapshot]; raw != "" {
-		if err := engine.DecodeRecord(raw, &out); err != nil {
-			return nil, err
+		if err := engine.DecodeRecord(raw, &all); err != nil {
+			return nil, nil, err
 		}
 	}
-	return out, nil
+	mine, _ = all[mg.name].(map[string]any)
+	if mine == nil {
+		mine = map[string]any{}
+	}
+	return all, mine, nil
+}
+
+// withMine is all with this migration's entries set to mine, or removed when
+// mine is empty.
+func (mg migrator) withMine(all, mine map[string]any) map[string]any {
+	out := make(map[string]any, len(all)+1)
+	for k, v := range all {
+		out[k] = v
+	}
+	if len(mine) == 0 {
+		delete(out, mg.name)
+	} else {
+		out[mg.name] = mine
+	}
+	return out
 }
 
 // parseEntry decodes a record entry into its before and after maps.

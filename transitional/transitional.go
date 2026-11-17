@@ -21,6 +21,13 @@ type Move struct {
 	To   []string
 }
 
+// Step is one field migration of a chain: the CRD file its objects are
+// stored under before it runs, and its moves.
+type Step struct {
+	FromFile string
+	Moves    []Move
+}
+
 // Generate returns the transitional schema of a field migration from the CRD
 // files fromFile and toFile:
 //
@@ -35,45 +42,60 @@ type Move struct {
 //     (see moveColumns);
 //  5. it refuses when the storage versions differ: that is a conversion.
 func Generate(fromFile, toFile string, moves []Move) ([]byte, error) {
-	from, err := kube.ReadCRDFile(fromFile)
-	if err != nil {
-		return nil, err
-	}
+	return GenerateChain(toFile, Step{FromFile: fromFile, Moves: moves})
+}
+
+// GenerateChain is Generate for field migrations that run one after another
+// on the same kind (v2: a → b, then v3: b → c): one schema, toFile's (the
+// last step's destination), declaring every path any step reads or writes,
+// so objects at any point of the chain keep their values. Each move's old
+// path takes its type and description from its own step's FromFile.
+func GenerateChain(toFile string, steps ...Step) ([]byte, error) {
 	to, err := kube.ReadCRDFile(toFile)
 	if err != nil {
 		return nil, err
 	}
-	fromV, toV := kube.StorageVersion(from), kube.StorageVersion(to)
-	if fromV == nil || toV == nil {
-		return nil, fmt.Errorf("both schemas need a storage version")
+	toV := kube.StorageVersion(to)
+	if toV == nil {
+		return nil, fmt.Errorf("%s needs a storage version", toFile)
 	}
-	if fromV.Name != toV.Name {
-		return nil, fmt.Errorf("%s stores %s and %s stores %s: changing the storage version is a conversion, not a field move", fromFile, fromV.Name, toFile, toV.Name)
-	}
-	fromSpec, toSpec := kube.SpecSchema(fromV), kube.SpecSchema(toV)
+	toSpec := kube.SpecSchema(toV)
 	if toSpec == nil {
 		return nil, fmt.Errorf("%s has no spec schema", toFile)
 	}
-
-	for _, m := range moves {
-		src := kube.SchemaAtV1(fromSpec, m.From)
-		switch dst := kube.SchemaAtV1(toSpec, m.From); {
-		case !kube.SchemaHoldsV1(toSpec, m.From):
-			if src == nil {
-				return nil, fmt.Errorf("spec.%s is not in %s", m.From, fromFile)
+	for _, step := range steps {
+		from, err := kube.ReadCRDFile(step.FromFile)
+		if err != nil {
+			return nil, err
+		}
+		fromV := kube.StorageVersion(from)
+		if fromV == nil {
+			return nil, fmt.Errorf("%s needs a storage version", step.FromFile)
+		}
+		if fromV.Name != toV.Name {
+			return nil, fmt.Errorf("%s stores %s and %s stores %s: changing the storage version is a conversion, not a field move", step.FromFile, fromV.Name, toFile, toV.Name)
+		}
+		fromSpec := kube.SpecSchema(fromV)
+		for _, m := range step.Moves {
+			src := kube.SchemaAtV1(fromSpec, m.From)
+			switch dst := kube.SchemaAtV1(toSpec, m.From); {
+			case !kube.SchemaHoldsV1(toSpec, m.From):
+				if src == nil {
+					return nil, fmt.Errorf("spec.%s is not in %s", m.From, step.FromFile)
+				}
+				kube.PutSchemaV1(toSpec, m.From, *src)
+			case dst != nil && src != nil && dst.Type != src.Type:
+				// The value changes shape in place (a fanout into its own key):
+				// while objects move, the path holds either.
+				kube.PutSchemaV1(toSpec, m.From, eitherShape(*src, *dst))
 			}
-			kube.PutSchemaV1(toSpec, m.From, *src)
-		case dst != nil && src != nil && dst.Type != src.Type:
-			// The value changes shape in place (a fanout into its own key):
-			// while objects move, the path holds either.
-			kube.PutSchemaV1(toSpec, m.From, eitherShape(*src, *dst))
+			for _, p := range m.To {
+				kube.MakeOptionalV1(toSpec, p)
+			}
 		}
-		for _, p := range m.To {
-			kube.MakeOptionalV1(toSpec, p)
-		}
+		toV.AdditionalPrinterColumns = moveColumns(fromV.AdditionalPrinterColumns, toV.AdditionalPrinterColumns, step.Moves)
 	}
 	kube.SetSpecSchema(toV, *toSpec)
-	toV.AdditionalPrinterColumns = moveColumns(fromV.AdditionalPrinterColumns, toV.AdditionalPrinterColumns, moves)
 	to.Status = apiextensionsv1.CustomResourceDefinitionStatus{}
 	to.CreationTimestamp.Reset()
 	return yaml.Marshal(to)

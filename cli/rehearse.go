@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"fmt"
@@ -57,8 +57,12 @@ specific cluster context; neither option creates or deletes a cluster.`,
 				if len(fileMs) == 0 {
 					continue
 				}
+				k, err := kome.KubeForConfig(kube.RestConfig(), kube.RESTMapper())
+				if err != nil {
+					return err
+				}
 				r := &rehearse.Rehearsal{
-					File: f, Engine: &kome.Engine{Kube: kube}, Cluster: rehearse.KubeCluster{Kube: kube},
+					File: f, Engine: &kome.Engine{Kube: k}, Cluster: rehearse.KubeCluster{Kube: kube},
 				}
 				if output != "json" {
 					r.Step = func(s rehearse.Step) { fmt.Fprintln(out, s) }

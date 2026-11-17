@@ -5,12 +5,18 @@ import (
 	"compress/gzip"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 
 	apivalidation "k8s.io/apimachinery/pkg/api/validation"
 )
+
+// ErrTooLarge is the error of a record that does not fit in the object's
+// annotations even compressed: the object is not migrated, since KOME never
+// migrates what it cannot take back.
+var ErrTooLarge = errors.New("the record is too large")
 
 // EncodeRecord returns rec as the value of the record annotation key on an
 // object whose annotations will be ann (key's own value aside). The record is
@@ -41,8 +47,8 @@ func EncodeRecord(rec any, key string, ann map[string]string) (string, error) {
 	}
 	all[key] = base64.StdEncoding.EncodeToString(buf.Bytes())
 	if apivalidation.ValidateAnnotationsSize(all) != nil {
-		return "", fmt.Errorf("the record is too large, even compressed: the annotations would be %d bytes, Kubernetes allows %d",
-			annotationBytes(all), apivalidation.TotalAnnotationSizeLimitB)
+		return "", fmt.Errorf("%w, even compressed: the annotations would be %d bytes, Kubernetes allows %d",
+			ErrTooLarge, annotationBytes(all), apivalidation.TotalAnnotationSizeLimitB)
 	}
 	return all[key], nil
 }

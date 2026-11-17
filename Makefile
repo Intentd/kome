@@ -14,8 +14,13 @@ OUTPUT_DIR ?= $(HOME)/.kome/bin
 build:
 	go build -ldflags "$(KOME_LDFLAGS)" -o $(OUTPUT_DIR)/kome ./cmd/kome
 
+# The tests run against envtest's API server; setup-envtest fetches it:
+#   go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.25
+ENVTEST_K8S_VERSION ?= 1.37.0
+ENVTEST_BIN_DIR     ?= $(HOME)/.envtest-bins
+
 test:
-	go test ./...
+	KUBEBUILDER_ASSETS="$$(setup-envtest use $(ENVTEST_K8S_VERSION) --bin-dir $(ENVTEST_BIN_DIR) -p path)" go test ./...
 
 vet:
 	go vet ./...

@@ -138,13 +138,15 @@ func (mr *migrationRun) field(ctx context.Context) error {
 		return err
 	}
 
-	// 8.
-	migrated, err := mr.specs(ctx, all)
+	// 8. An object with a known issue was never migrated, so to.schema drops
+	// its old fields: that is the issue already reported, not checked again.
+	checked := append(append(append([]*unstructured.Unstructured{}, from...), unselected...), to...)
+	migrated, err := mr.specs(ctx, checked)
 	if err == nil {
 		err = mr.applySchema(ctx, d.To.Schema)
 	}
 	if err == nil {
-		final, rerr := mr.specs(ctx, all)
+		final, rerr := mr.specs(ctx, checked)
 		if err = rerr; err == nil {
 			err = nothingDropped(migrated, final)
 		}

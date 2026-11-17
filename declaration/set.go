@@ -11,7 +11,7 @@ import (
 )
 
 // Set changes migration name for one run: assignment is "key=value" with the
-// key a dot path relative to the migration ("prune", "to.namespace",
+// key a dot path relative to the migration ("lifecycle.prune", "to.namespace",
 // "spec.replicas.to") and the value YAML ("true", "[a, b]", a string). The
 // result is decoded strictly, so an unknown key or a wrong type is an error;
 // run Validate after.

@@ -6,6 +6,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -77,7 +78,7 @@ func (a Annotations) IsTooling(key string) bool {
 
 // Runner carries the settings of one run.
 type Runner struct {
-	Kube         kubeclient.Interface
+	Kube         Kube
 	Mode         Mode
 	Annotations  Annotations
 	FieldManager string
@@ -90,10 +91,23 @@ type Runner struct {
 	Strict bool
 	// Force makes server-side apply take ownership on conflict.
 	Force bool
+	// Apply is whether FieldManager is KOME's own, so destinations may be
+	// server-side applied under it. A manager declared in the file belongs
+	// to an operator: applying as it would make the operator's next apply
+	// remove what KOME wrote, so writes are plain create and patch.
+	Apply bool
 	// PageSize is the List page size; 0 lets the API server decide.
 	PageSize int64
 	// Progress, when set, is called after each object.
 	Progress func(migration string, done, total int)
+}
+
+// WithFieldManager returns a copy of r writing as fm; own says whether fm is
+// KOME's own (see Apply).
+func (r *Runner) WithFieldManager(fm string, own bool) *Runner {
+	out := *r
+	out.FieldManager, out.Apply = fm, own
+	return &out
 }
 
 // Report calls Progress when it is set.
@@ -125,7 +139,7 @@ func (r *Runner) Patch(ctx context.Context, resource dynamic.NamespaceableResour
 
 // Resource resolves gvk's dynamic resource and whether it is cluster-scoped.
 func (r *Runner) Resource(gvk schema.GroupVersionKind) (dynamic.NamespaceableResourceInterface, bool, error) {
-	resource, clusterScoped, err := kubeclient.DynamicResourceFor(r.Kube, gvk)
+	resource, clusterScoped, err := r.Kube.Resource(gvk)
 	if err != nil {
 		return nil, false, fmt.Errorf("resolve the resource of %s: %w", gvk.Kind, err)
 	}
@@ -155,6 +169,9 @@ type ObjectResult struct {
 	Skipped bool
 	// Excluded: the object failed the selection's conditions; also Skipped.
 	Excluded bool
+	// TooLarge: its record would not fit in its annotations even compressed,
+	// so it was not migrated (Err says by how much).
+	TooLarge bool
 	Err      error
 }
 
@@ -178,7 +195,7 @@ type Result struct {
 // Fail builds the result of a failed object, and the line to collect in
 // strict mode.
 func (r *Runner) Fail(obj *unstructured.Unstructured, err error) (ObjectResult, string) {
-	res := ObjectResult{Namespace: obj.GetNamespace(), Name: obj.GetName(), Err: err}
+	res := ObjectResult{Namespace: obj.GetNamespace(), Name: obj.GetName(), Err: err, TooLarge: errors.Is(err, ErrTooLarge)}
 	if r.Strict {
 		return res, fmt.Sprintf("%s: %s", ObjRef(obj), err)
 	}

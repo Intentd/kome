@@ -25,7 +25,7 @@ func (mg *migrator) processUp(ctx context.Context, src *unstructured.Unstructure
 		res.Skipped, res.Excluded = true, true
 		return res, ""
 	}
-	dst, err := mg.destination(src)
+	dst, err := mg.destination(src, nil)
 	if err != nil {
 		return mg.Fail(src, err)
 	}
@@ -52,14 +52,24 @@ func (mg *migrator) processUp(ctx context.Context, src *unstructured.Unstructure
 		// Already migrated, or written by someone else first: finish a prune
 		// an earlier run did not.
 		if mg.m.Prune {
-			// A destination the migration did not create has no record: record
-			// the source on it first, so down can bring it back.
-			if !migrated {
-				if err := mg.recordOn(ctx, src, existing); err != nil {
+			plan, err := mg.planPrune(ctx, src, existing.GetNamespace())
+			if err != nil {
+				return mg.Fail(src, err)
+			}
+			// Record the plan before acting on it, so down can undo what the
+			// prune does. A destination the migration did not create has no
+			// record yet: the source is recorded on it, marked as existing.
+			rec := mg.newRecord(src, existing, true, true)
+			if migrated {
+				if rec, err = mg.recordOf(existing); err != nil {
 					return mg.Fail(src, err)
 				}
+				rec.Pruned = true
 			}
-			if err := mg.prune(ctx, src); err != nil {
+			if err := mg.recordOn(ctx, existing, rec.withPlan(mg.m.Children, plan)); err != nil {
+				return mg.Fail(src, err)
+			}
+			if err := mg.prune(ctx, src, existing, plan); err != nil {
 				return mg.Fail(src, err)
 			}
 			res.Pruned = true
@@ -70,6 +80,17 @@ func (mg *migrator) processUp(ctx context.Context, src *unstructured.Unstructure
 	}
 
 	mg.claim(dst, src)
+	// A prune is planned before anything is written, and its plan goes into
+	// the destination's record with the destination itself.
+	var plan *prunePlan
+	if mg.m.Prune {
+		if plan, err = mg.planPrune(ctx, src, dst.GetNamespace()); err != nil {
+			return mg.Fail(src, err)
+		}
+		if dst, err = mg.destination(src, plan); err != nil {
+			return mg.Fail(src, err)
+		}
+	}
 	// Dry-run first: the server applies defaults and drops unknown fields,
 	// so this shows what the destination would really hold.
 	preview, err := mg.apply(ctx, dst, true)
@@ -96,7 +117,7 @@ func (mg *migrator) processUp(ctx context.Context, src *unstructured.Unstructure
 		}
 	}
 	if mg.m.Prune {
-		if err := mg.prune(ctx, src); err != nil {
+		if err := mg.prune(ctx, src, applied, plan); err != nil {
 			return mg.Fail(src, err)
 		}
 		res.Pruned = true
@@ -104,10 +125,11 @@ func (mg *migrator) processUp(ctx context.Context, src *unstructured.Unstructure
 	return res, ""
 }
 
-// destination builds the destination of src with its record; it is not
-// applied. It keeps the source's name and spec, takes its namespace by scope,
-// and its labels and annotations per the migration.
-func (mg *migrator) destination(src *unstructured.Unstructured) (*unstructured.Unstructured, error) {
+// destination builds the destination of src with its record (including the
+// prune's plan, when there is one); it is not applied. It keeps the source's
+// name and spec, takes its namespace by scope, and its labels and annotations
+// per the migration.
+func (mg *migrator) destination(src *unstructured.Unstructured, plan *prunePlan) (*unstructured.Unstructured, error) {
 	dst := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": mg.m.To.GroupVersion().String(),
 		"kind":       mg.m.To.Kind,
@@ -138,7 +160,7 @@ func (mg *migrator) destination(src *unstructured.Unstructured) (*unstructured.U
 	}
 
 	ann[mg.Annotations.Timestamp] = time.Now().UTC().Format(time.RFC3339)
-	rec, err := mg.encodeRecord(src, dst, mg.m.Prune, false, ann)
+	rec, err := mg.encodeRecord(src, dst, mg.m.Prune, false, plan, ann)
 	if err != nil {
 		return nil, err
 	}
@@ -180,9 +202,21 @@ func (mg *migrator) get(ctx context.Context, dst *unstructured.Unstructured) (*u
 	return existing, nil
 }
 
-// apply server-side applies the destination and returns what the server
-// produced.
+// apply writes the new destination and returns what the server produced:
+// server-side applied under KOME's own manager, created under an operator's
+// (see engine.Runner.Apply), so the operator's next apply does not remove it.
 func (mg *migrator) apply(ctx context.Context, dst *unstructured.Unstructured, dryRun bool) (*unstructured.Unstructured, error) {
+	if !mg.Apply {
+		opts := metav1.CreateOptions{FieldManager: mg.FieldManager}
+		if dryRun {
+			opts.DryRun = []string{metav1.DryRunAll}
+		}
+		out, err := mg.dstResource.Namespace(dst.GetNamespace()).Create(ctx, dst, opts)
+		if err != nil {
+			return nil, fmt.Errorf("create the destination: %w", err)
+		}
+		return out, nil
+	}
 	body, err := json.Marshal(dst.Object)
 	if err != nil {
 		return nil, fmt.Errorf("encode the destination: %w", err)
@@ -198,37 +232,23 @@ func (mg *migrator) apply(ctx context.Context, dst *unstructured.Unstructured, d
 	return out, nil
 }
 
-// prune deletes the source once the destination holds every source field.
-// The precondition fails the delete if the source changed since it was read,
-// so a newer write is never lost; the next run reports it as drifted.
-func (mg *migrator) prune(ctx context.Context, src *unstructured.Unstructured) error {
-	err := mg.Kube.Delete(ctx, src, metav1.DeleteOptions{DryRun: mg.DryRunOpt(), Preconditions: unchanged(src)})
-	if apierrors.IsConflict(err) {
-		return fmt.Errorf("the source changed during the migration; not pruned, run again to review")
-	}
-	if err != nil {
-		return fmt.Errorf("destination applied; prune the source: %w", err)
-	}
-	return nil
-}
-
-// recordOn writes the source's record onto a destination the migration did
-// not create, marked so, before the source is pruned. It carries the
-// destination's resourceVersion, so it fails rather than write over an edit.
-func (mg *migrator) recordOn(ctx context.Context, src, existing *unstructured.Unstructured) error {
+// recordOn writes rec onto an existing destination before its source is
+// pruned. It carries the destination's resourceVersion, so it fails rather
+// than write over an edit.
+func (mg *migrator) recordOn(ctx context.Context, existing *unstructured.Unstructured, rec record) error {
 	ann := map[string]string{}
 	for k, v := range existing.GetAnnotations() {
 		ann[k] = v
 	}
 	ann[mg.Annotations.Timestamp] = time.Now().UTC().Format(time.RFC3339)
-	rec, err := mg.encodeRecord(src, existing, true, true, ann)
+	raw, err := engine.EncodeRecord(rec, mg.Annotations.KindSnapshot, ann)
 	if err != nil {
 		return err
 	}
 	patch, err := json.Marshal(map[string]any{"metadata": map[string]any{
 		"resourceVersion": existing.GetResourceVersion(),
 		"annotations": map[string]string{
-			mg.Annotations.KindSnapshot: rec,
+			mg.Annotations.KindSnapshot: raw,
 			mg.Annotations.Timestamp:    ann[mg.Annotations.Timestamp],
 		},
 	}})
@@ -236,7 +256,7 @@ func (mg *migrator) recordOn(ctx context.Context, src, existing *unstructured.Un
 		return err
 	}
 	_, err = mg.dstResource.Namespace(existing.GetNamespace()).Patch(ctx, existing.GetName(),
-		k8stypes.MergePatchType, patch, metav1.PatchOptions{DryRun: mg.DryRunOpt()})
+		k8stypes.MergePatchType, patch, metav1.PatchOptions{DryRun: mg.DryRunOpt(), FieldManager: mg.FieldManager})
 	if apierrors.IsConflict(err) {
 		return fmt.Errorf("the destination changed during the migration; source not pruned, run again to review")
 	}

@@ -155,7 +155,7 @@ func (mr *migrationRun) with(prune bool) kome.Migrations {
 // with no namespace when the destination is cluster-scoped.
 func (mr *migrationRun) destinations(from []*unstructured.Unstructured) []*unstructured.Unstructured {
 	clusterScoped := false
-	if m, err := mr.Engine.Kube.RESTMapper().RESTMapping(mr.m.Kind.To.GroupKind(), mr.m.Kind.To.Version); err == nil {
+	if m, err := mr.Engine.Kube.Mapping(mr.m.Kind.To); err == nil {
 		clusterScoped = m.Scope.Name() == meta.RESTScopeNameRoot
 	}
 	out := make([]*unstructured.Unstructured, 0, len(from))

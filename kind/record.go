@@ -1,6 +1,8 @@
 package kind
 
 import (
+	"fmt"
+
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -18,6 +20,47 @@ type record struct {
 	Destination        recordTarget `json:"destination"`
 	Pruned             bool         `json:"pruned"`
 	DestinationExisted bool         `json:"destinationExisted,omitempty"`
+	// Children is the policy the prune used; Reparented the children it
+	// pointed at the destination (down points them back); FinalizersRemoved
+	// the finalizers it took off the source (down puts them back).
+	Children          string     `json:"children,omitempty"`
+	Reparented        []childRef `json:"reparented,omitempty"`
+	FinalizersRemoved []string   `json:"finalizersRemoved,omitempty"`
+	// FieldManager is the manager the move wrote as; down writes as it too.
+	FieldManager string `json:"fieldManager,omitempty"`
+}
+
+// withPlan adds a prune's plan to the record: children it reparents join
+// those already recorded.
+func (r record) withPlan(policy string, plan *prunePlan) record {
+	if plan == nil {
+		return r
+	}
+	r.Children = policy
+	seen := map[childRef]bool{}
+	for _, c := range r.Reparented {
+		seen[c] = true
+	}
+	for _, c := range plan.reparented() {
+		if !seen[c] {
+			r.Reparented, seen[c] = append(r.Reparented, c), true
+		}
+	}
+	for _, f := range plan.finalizers {
+		if !containsString(r.FinalizersRemoved, f) {
+			r.FinalizersRemoved = append(r.FinalizersRemoved, f)
+		}
+	}
+	return r
+}
+
+func containsString(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 type recordSource struct {
@@ -48,7 +91,12 @@ type recordTarget struct {
 // other annotations are ann (see engine.EncodeRecord). Tooling annotations
 // are left out of the record: restoring them would claim a provenance the
 // restore did not produce.
-func (mg *migrator) encodeRecord(src, dst *unstructured.Unstructured, pruned, existed bool, ann map[string]string) (string, error) {
+func (mg *migrator) encodeRecord(src, dst *unstructured.Unstructured, pruned, existed bool, plan *prunePlan, ann map[string]string) (string, error) {
+	return engine.EncodeRecord(mg.newRecord(src, dst, pruned, existed).withPlan(mg.m.Children, plan), mg.Annotations.KindSnapshot, ann)
+}
+
+// newRecord records src moving to dst.
+func (mg *migrator) newRecord(src, dst *unstructured.Unstructured, pruned, existed bool) record {
 	rec := record{
 		Source: recordSource{
 			APIVersion: src.GetAPIVersion(),
@@ -64,9 +112,10 @@ func (mg *migrator) encodeRecord(src, dst *unstructured.Unstructured, pruned, ex
 		},
 		Destination: recordTarget{APIVersion: dst.GetAPIVersion(), Kind: dst.GetKind()},
 		Pruned:      pruned, DestinationExisted: existed,
+		FieldManager: mg.FieldManager,
 	}
 	rec.Destination.Metadata.Name, rec.Destination.Metadata.Namespace = dst.GetName(), dst.GetNamespace()
-	return engine.EncodeRecord(rec, mg.Annotations.KindSnapshot, ann)
+	return rec
 }
 
 func (mg *migrator) userAnnotations(ann map[string]string) map[string]string {
@@ -80,6 +129,19 @@ func (mg *migrator) userAnnotations(ann map[string]string) map[string]string {
 		return nil
 	}
 	return out
+}
+
+// recordOf decodes the record on a destination.
+func (mg *migrator) recordOf(dst *unstructured.Unstructured) (record, error) {
+	var rec record
+	raw := dst.GetAnnotations()[mg.Annotations.KindSnapshot]
+	if raw == "" {
+		return rec, fmt.Errorf("%s has no record", engine.ObjRef(dst))
+	}
+	if err := engine.DecodeRecord(raw, &rec); err != nil {
+		return rec, err
+	}
+	return rec, nil
 }
 
 // recordedSource returns the source recorded on a destination.
@@ -122,6 +184,9 @@ func (r record) sourceObject() *unstructured.Unstructured {
 	}
 	if len(meta.Annotations) > 0 {
 		src.SetAnnotations(meta.Annotations)
+	}
+	if len(r.FinalizersRemoved) > 0 {
+		src.SetFinalizers(r.FinalizersRemoved)
 	}
 	if r.Source.Spec != nil {
 		src.Object["spec"] = runtime.DeepCopyJSONValue(r.Source.Spec)

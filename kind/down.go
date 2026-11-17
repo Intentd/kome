@@ -10,10 +10,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8stypes "k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/dynamic"
 
 	"github.com/intentd/kome/engine"
-	"github.com/intentd/tools/kubeclient"
 	"github.com/intentd/tools/structured"
 )
 
@@ -68,10 +66,21 @@ func (mg *migrator) down(ctx context.Context, dst *unstructured.Unstructured) (d
 	if len(structured.MissingPaths(rec.Source.Spec, current)) > 0 {
 		return downDrifted, nil, nil
 	}
+	// Undo as the manager that did the move, even if the file changed since.
+	if rec.FieldManager != "" && rec.FieldManager != mg.FieldManager {
+		mg = mg.as(rec.FieldManager)
+	}
 	// Always: a later run may have pruned the source after the record was
-	// written. recreate skips a source that still exists.
-	if err := mg.recreate(ctx, &rec); err != nil {
+	// written. recreate skips a source that still exists. The source comes
+	// back first (with a new uid), then the children the prune reparented
+	// are pointed at it, and only then is the destination deleted: a child
+	// left pointing at a deleted owner is garbage-collected.
+	src, err := mg.recreate(ctx, &rec)
+	if err != nil {
 		return downNone, nil, fmt.Errorf("recreate the source: %w", err)
+	}
+	if err := mg.repointBack(ctx, &rec, dst, src); err != nil {
+		return downNone, nil, err
 	}
 	// The migration did not create this destination: drop its record from it
 	// and leave it as it was.
@@ -87,34 +96,30 @@ func (mg *migrator) down(ctx context.Context, dst *unstructured.Unstructured) (d
 	return downRestored, rec.Source.Spec, nil
 }
 
-// recreate creates the source from the record; one that still exists is
-// left as it is.
-func (mg *migrator) recreate(ctx context.Context, rec *record) error {
+// recreate creates the source from the record, finalizers the prune removed
+// included, and returns it; one that still exists is returned as it is.
+func (mg *migrator) recreate(ctx context.Context, rec *record) (*unstructured.Unstructured, error) {
 	gvk := schema.FromAPIVersionAndKind(rec.Source.APIVersion, rec.Source.Kind)
-	gvr, err := kubeclient.GVRForGVK(mg.Kube, gvk)
-	if err != nil {
-		return fmt.Errorf("resolve the source's resource: %w", err)
-	}
 	meta := rec.Source.Metadata
-	var ri dynamic.ResourceInterface = mg.Kube.DynamicClient().Resource(gvr)
-	if meta.Namespace != "" {
-		ri = mg.Kube.DynamicClient().Resource(gvr).Namespace(meta.Namespace)
+	ri, err := mg.Kube.ResourceIn(gvk, meta.Namespace)
+	if err != nil {
+		return nil, fmt.Errorf("resolve the source's resource: %w", err)
 	}
-	_, err = ri.Get(ctx, meta.Name, metav1.GetOptions{})
+	existing, err := ri.Get(ctx, meta.Name, metav1.GetOptions{})
 	if err == nil {
-		return nil
+		return existing, nil
 	}
 	if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("get the source: %w", err)
+		return nil, fmt.Errorf("get the source: %w", err)
 	}
-	created, err := ri.Create(ctx, rec.sourceObject(), metav1.CreateOptions{DryRun: mg.DryRunOpt()})
+	created, err := ri.Create(ctx, rec.sourceObject(), metav1.CreateOptions{DryRun: mg.DryRunOpt(), FieldManager: mg.FieldManager})
 	if err != nil {
-		return fmt.Errorf("create the source: %w", err)
+		return nil, fmt.Errorf("create the source: %w", err)
 	}
 	if err := mg.writeStatus(ctx, ri, created, rec.Source.Status); err != nil {
-		return fmt.Errorf("restore the source's status: %w", err)
+		return nil, fmt.Errorf("restore the source's status: %w", err)
 	}
-	return nil
+	return created, nil
 }
 
 // dropRecord removes the record from a destination it keeps, guarded by the
@@ -128,6 +133,6 @@ func (mg *migrator) dropRecord(ctx context.Context, dst *unstructured.Unstructur
 		return err
 	}
 	_, err = mg.dstResource.Namespace(dst.GetNamespace()).Patch(ctx, dst.GetName(), k8stypes.MergePatchType, patch,
-		metav1.PatchOptions{DryRun: mg.DryRunOpt()})
+		metav1.PatchOptions{DryRun: mg.DryRunOpt(), FieldManager: mg.FieldManager})
 	return err
 }

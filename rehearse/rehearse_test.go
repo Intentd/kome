@@ -3,7 +3,6 @@ package rehearse_test
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,139 +10,16 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	k8stypes "k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/dynamic"
-	"sigs.k8s.io/yaml"
 
 	"github.com/intentd/kome"
 	"github.com/intentd/kome/declaration"
+	"github.com/intentd/kome/internal/testutil"
 	"github.com/intentd/kome/rehearse"
-	"github.com/intentd/tools/kube"
 	"github.com/intentd/tools/kubeclient"
-	"github.com/intentd/tools/kubeclient/kubefake"
-	"github.com/intentd/tools/kubeclient/kubefake/object"
 )
 
-// fakeCluster is a kubefake client whose mapper learns each CRD ApplyCRD
-// installs, with server-side apply and delete preconditions.
-type fakeCluster struct {
-	*kubefake.Kubeclient
-	dyn    *kubefake.Dynamic
-	mapper *meta.DefaultRESTMapper
-}
-
-var lists = map[schema.GroupVersionResource]string{
-	kube.CRDResource: "CustomResourceDefinitionList",
-	{Group: "batch.example.com", Version: "v1", Resource: "cronjobs"}:       "CronJobList",
-	{Group: "config.example.com", Version: "v1", Resource: "appconfigs"}:    "AppConfigList",
-	{Group: "config.example.com", Version: "v1", Resource: "newconfigs"}:    "NewConfigList",
-	{Group: "config.example.com", Version: "v1", Resource: "globalconfigs"}: "GlobalConfigList",
-}
-
-func newFakeCluster() *fakeCluster {
-	dyn := kubefake.NewDynamic(runtime.NewScheme(), lists)
-	f := &fakeCluster{Kubeclient: kubefake.New(runtime.NewScheme()), dyn: dyn, mapper: meta.NewDefaultRESTMapper(nil)}
-	tracker := dyn.Tracker()
-	dyn.PrependReactor("patch", "*", func(a kubefake.Action) (bool, runtime.Object, error) {
-		pa := a.(kubefake.PatchActionImpl)
-		if pa.GetPatchType() != k8stypes.ApplyPatchType {
-			if len(pa.GetPatchOptions().DryRun) > 0 {
-				cur, err := tracker.Get(pa.GetResource(), pa.GetNamespace(), pa.GetName())
-				return true, cur, err
-			}
-			return false, nil, nil
-		}
-		u := object.Empty()
-		if err := u.UnmarshalJSON(pa.GetPatch()); err != nil {
-			return true, nil, err
-		}
-		if len(pa.GetPatchOptions().DryRun) > 0 {
-			return true, u, nil
-		}
-		gvr := pa.GetResource()
-		if cur, err := tracker.Get(gvr, pa.GetNamespace(), pa.GetName()); err == nil {
-			u.SetResourceVersion(cur.(metav1.Object).GetResourceVersion())
-			return true, u, tracker.Update(gvr, u, pa.GetNamespace())
-		}
-		return true, u, tracker.Create(gvr, u, pa.GetNamespace())
-	})
-	dyn.PrependReactor("delete", "*", func(a kubefake.Action) (bool, runtime.Object, error) {
-		da := a.(kubefake.DeleteActionImpl)
-		opts := da.GetDeleteOptions()
-		if p := opts.Preconditions; p != nil && p.ResourceVersion != nil {
-			cur, err := tracker.Get(da.GetResource(), da.GetNamespace(), da.GetName())
-			if err == nil && cur.(metav1.Object).GetResourceVersion() != *p.ResourceVersion {
-				return true, nil, apierrors.NewConflict(da.GetResource().GroupResource(), da.GetName(), fmt.Errorf("changed"))
-			}
-		}
-		return len(opts.DryRun) > 0, nil, nil
-	})
-	dyn.PrependReactor("create", "*", func(a kubefake.Action) (bool, runtime.Object, error) {
-		if len(a.(kubefake.CreateActionImpl).GetCreateOptions().DryRun) > 0 {
-			return true, a.(kubefake.CreateActionImpl).GetObject(), nil
-		}
-		return false, nil, nil
-	})
-	return f
-}
-
-func (f *fakeCluster) DynamicClient() dynamic.Interface { return f.dyn }
-func (f *fakeCluster) RESTMapper() meta.RESTMapper      { return f.mapper }
-
-func (f *fakeCluster) Delete(ctx context.Context, obj kubeclient.Object, opts metav1.DeleteOptions) error {
-	u := obj.(*unstructured.Unstructured)
-	m, err := f.mapper.RESTMapping(u.GroupVersionKind().GroupKind(), u.GroupVersionKind().Version)
-	if err != nil {
-		return err
-	}
-	return f.dyn.Resource(m.Resource).Namespace(u.GetNamespace()).Delete(ctx, u.GetName(), opts)
-}
-
-// ApplyCRD stores the CRD, marked established, and teaches the mapper.
-func (f *fakeCluster) ApplyCRD(ctx context.Context, manifest []byte) error {
-	var crd apiextensionsv1.CustomResourceDefinition
-	if err := yaml.Unmarshal(manifest, &crd); err != nil {
-		return err
-	}
-	scope := meta.RESTScopeNamespace
-	if crd.Spec.Scope == apiextensionsv1.ClusterScoped {
-		scope = meta.RESTScopeRoot
-	}
-	v := kube.StorageVersion(&crd)
-	f.mapper.Add(schema.GroupVersionKind{Group: crd.Spec.Group, Version: v.Name, Kind: crd.Spec.Names.Kind}, scope)
-	u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&crd)
-	if err != nil {
-		return err
-	}
-	obj := &unstructured.Unstructured{Object: u}
-	obj.SetAPIVersion("apiextensions.k8s.io/v1")
-	obj.SetKind("CustomResourceDefinition")
-	tr := f.dyn.Tracker()
-	if _, err := tr.Get(kube.CRDResource, "", crd.Name); err == nil {
-		return tr.Update(kube.CRDResource, obj, "")
-	}
-	return tr.Create(kube.CRDResource, obj, "")
-}
-
-func (f *fakeCluster) cluster() rehearse.Cluster {
-	return testCluster{KubeCluster: rehearse.KubeCluster{Kube: f}, f: f}
-}
-
-// testCluster is KubeCluster with the fake's ApplyCRD.
-type testCluster struct {
-	rehearse.KubeCluster
-	f *fakeCluster
-}
-
-func (c testCluster) ApplyCRD(ctx context.Context, manifest []byte) error {
-	return c.f.ApplyCRD(ctx, manifest)
+func TestMain(m *testing.M) {
+	os.Exit(testutil.Run(m))
 }
 
 // fileWith writes a KOME file and its objects next to the typed schemas.
@@ -167,9 +43,12 @@ func rehearsal(t *testing.T, f *declaration.File) (rehearse.Report, error) {
 	t.Helper()
 	ms, err := kome.FromFile(f)
 	require.NoError(t, err)
-	fc := newFakeCluster()
-	r := &rehearse.Rehearsal{File: f, Engine: &kome.Engine{Kube: fc}, Cluster: fc.cluster()}
-	return r.Run(context.Background(), ms)
+	ctx := context.Background()
+	testutil.RemoveCRDs(t)
+	kc, err := kubeclient.NewFromConfig(ctx, testutil.Config(), nil)
+	require.NoError(t, err)
+	r := &rehearse.Rehearsal{File: f, Engine: &kome.Engine{Kube: testutil.Kube()}, Cluster: rehearse.KubeCluster{Kube: kc}}
+	return r.Run(ctx, ms)
 }
 
 func names(steps []rehearse.Step) []string {
@@ -226,23 +105,23 @@ migrations:
 apiVersion: config.example.com/v1
 kind: AppConfig
 metadata: {name: a, namespace: default}
-spec: {image: nginx, replicas: 2, extra: x}
+spec: {image: nginx, replicas: 2, extra: one}
 ---
 apiVersion: config.example.com/v1
 kind: AppConfig
 metadata: {name: b, namespace: default}
-spec: {image: busybox, replicas: 1, extra: y}
+spec: {image: busybox, replicas: 1, extra: two}
 ---
 apiVersion: config.example.com/v1
 kind: AppConfig
 metadata: {name: c, namespace: default}
-spec: {image: redis, replicas: 1, extra: z}
+spec: {image: redis, replicas: 1, extra: three}
 `,
 		"dst.yaml": `
 apiVersion: config.example.com/v1
 kind: NewConfig
 metadata: {name: c, namespace: default}
-spec: {image: redis, replicas: 1, extra: z}
+spec: {image: redis, replicas: 1, extra: three}
 `,
 	})
 	rep, err := rehearsal(t, f)
@@ -268,17 +147,17 @@ migrations:
 apiVersion: config.example.com/v1
 kind: AppConfig
 metadata: {name: payments, namespace: team-a}
-spec: {image: a, replicas: 1, extra: x}
+spec: {image: a, replicas: 1, extra: one}
 ---
 apiVersion: config.example.com/v1
 kind: AppConfig
 metadata: {name: payments, namespace: team-c}
-spec: {image: c, replicas: 2, extra: y}
+spec: {image: c, replicas: 2, extra: two}
 ---
 apiVersion: config.example.com/v1
 kind: AppConfig
 metadata: {name: billing, namespace: team-b}
-spec: {image: b, replicas: 1, extra: z}
+spec: {image: b, replicas: 1, extra: three}
 `})
 	rep, err := rehearsal(t, f)
 	require.NoError(t, err, "%v", names(rep.Steps))

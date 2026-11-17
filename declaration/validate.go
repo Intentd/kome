@@ -1,11 +1,17 @@
 package declaration
 
 import (
+	"text/template"
+
 	"errors"
 	"fmt"
+	"github.com/intentd/kel"
+	"github.com/intentd/tools/resolver"
 	"sort"
 	"strings"
 
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/validation"
 
@@ -69,6 +75,7 @@ func (r Report) Err() error {
 type checker struct {
 	name     string
 	findings *[]Finding
+	funcs    template.FuncMap // the template functions templates are checked with
 }
 
 func (c checker) err(path, format string, args ...any) {
@@ -82,17 +89,35 @@ func (c checker) warn(path, format string, args ...any) {
 // Validate runs the offline checks that need no schema contents: the
 // identities, the level, the keys each level allows, scopes, field moves,
 // selection and metadata.
-func (f *File) Validate() Report {
+func (f *File) Validate() Report { return f.ValidateWith(nil) }
+
+// ValidateWith is Validate checking templates against funcs: KEL's when nil;
+// a caller that adds its own functions passes kel.FuncMap() with them.
+func (f *File) ValidateWith(funcs template.FuncMap) Report {
+	if funcs == nil {
+		funcs = kel.FuncMap()
+	}
 	var findings []Finding
 	if len(f.Migrations) == 0 {
 		findings = append(findings, Finding{Message: "no migrations"})
 	}
 	for _, name := range f.Names() {
-		c := checker{name: name, findings: &findings}
+		c := checker{name: name, findings: &findings, funcs: funcs}
+		for _, n := range f.Migrations[name].Needs {
+			switch _, ok := f.Migrations[n]; {
+			case n == name:
+				c.err("needs", "a migration can't need itself")
+			case !ok:
+				c.err("needs", "%q is not a migration in the file", n)
+			}
+		}
 		if msgs := validation.IsDNS1123Label(name); len(msgs) > 0 {
 			c.err("", "name %q: %s", name, strings.Join(msgs, "; "))
 		}
 		f.check(c, f.Migrations[name])
+	}
+	if _, err := f.Order(); err != nil && !strings.Contains(err.Error(), "not in the file") {
+		findings = append(findings, Finding{Message: err.Error()})
 	}
 	return Report{Findings: findings}
 }
@@ -121,7 +146,7 @@ func (f *File) check(c checker, m Migration) {
 			"to.namespace":  m.To.Namespace != "",
 			"to.metadata":   m.To.Metadata != nil,
 			"to.copyStatus": m.To.CopyStatus,
-			"prune":         m.Prune,
+			"lifecycle":     m.Lifecycle != nil,
 		} {
 			if set {
 				c.err(path, "applies to kind moves; this migration moves fields")
@@ -138,15 +163,87 @@ func (f *File) check(c checker, m Migration) {
 		if fromErr == nil && toErr == nil && from.FromFile && to.FromFile {
 			checkScopes(c, from, to, m.To.Namespace)
 		}
-		if m.Prune {
-			c.warn("prune", "deletes each source once its destination holds every source field")
-		}
+		checkLifecycle(c, m.Lifecycle)
 		checkMetadata(c, m.To.Metadata)
 	}
 	checkSelection(c, m.Selection)
+	for _, e := range metav1validation.ValidateFieldManager(m.FieldManager, nil) {
+		c.err("fieldManager", "%q: %s", m.FieldManager, e.Detail)
+	}
 	if fromErr == nil && toErr == nil {
 		f.checkSchemas(c, m, from, to)
 	}
+}
+
+// IsSystemFinalizer reports whether f belongs to Kubernetes itself
+// (kubernetes.io/*, and garbage collection's foregroundDeletion and orphan):
+// removing one breaks garbage collection or volume protection, so KOME never
+// does.
+func IsSystemFinalizer(f string) bool {
+	return f == "foregroundDeletion" || f == "orphan" || strings.HasPrefix(f, "kubernetes.io/")
+}
+
+func checkLifecycle(c checker, lc *Lifecycle) {
+	for _, p := range LifecycleProblems(lc) {
+		if p.Warning {
+			c.warn(p.Path, "%s", p.Message)
+		} else {
+			c.err(p.Path, "%s", p.Message)
+		}
+	}
+}
+
+// Problem is one finding about part of a migration: the path under it, what
+// is wrong, and whether it is only a warning.
+type Problem struct {
+	Path    string
+	Message string
+	Warning bool
+}
+
+// LifecycleProblems checks a lifecycle block offline: children and
+// finalizers need prune, children is reparent, orphan or delete, finalizers
+// are valid names listed once and never Kubernetes' own, and pruning is
+// warned about. KOME's validate and Inrun's Blueprint validation both use it.
+func LifecycleProblems(lc *Lifecycle) []Problem {
+	if lc == nil {
+		return nil
+	}
+	var out []Problem
+	add := func(path, format string, args ...any) {
+		out = append(out, Problem{Path: path, Message: fmt.Sprintf(format, args...)})
+	}
+	if !lc.Prune {
+		if lc.Children != "" {
+			add("lifecycle.children", "applies when pruning; set lifecycle.prune")
+		}
+		if len(lc.Finalizers) > 0 {
+			add("lifecycle.finalizers", "applies when pruning; set lifecycle.prune")
+		}
+		return out
+	}
+	out = append(out, Problem{Path: "lifecycle.prune", Warning: true,
+		Message: "deletes each source once its destination holds every source field; dry-run lists the children and finalizers of live sources"})
+	switch lc.Children {
+	case "", ChildrenReparent, ChildrenOrphan, ChildrenDelete:
+	default:
+		add("lifecycle.children", "%q: one of reparent, orphan, delete", lc.Children)
+	}
+	seen := map[string]bool{}
+	for _, f := range lc.Finalizers {
+		switch {
+		case seen[f]:
+			add("lifecycle.finalizers", "%q is listed twice", f)
+		case IsSystemFinalizer(f):
+			add("lifecycle.finalizers", "%q belongs to Kubernetes and is never removed", f)
+		default:
+			if msgs := validation.IsQualifiedName(f); len(msgs) > 0 {
+				add("lifecycle.finalizers", "%q: %s", f, strings.Join(msgs, "; "))
+			}
+		}
+		seen[f] = true
+	}
+	return out
 }
 
 func checkScopes(c checker, from, to Identity, namespace string) {
@@ -184,6 +281,7 @@ func checkFields(c checker, spec map[string]Field) {
 		if len(fl.Values) > 0 && (fl.To != "" || fl.Value != "") {
 			c.warn(at, "values is set, so to and value are ignored")
 		}
+
 		src := fl.SourcePath(key)
 		for other, otherSrc := range sources {
 			if src == otherSrc || strings.HasPrefix(src, otherSrc+".") || strings.HasPrefix(otherSrc, src+".") {
@@ -202,6 +300,60 @@ func checkFields(c checker, spec map[string]Field) {
 			writes = append(writes, write{key, dst})
 		}
 	}
+}
+
+// objectVars are the data of a kind move's metadata values: the source
+// object's top-level fields.
+var objectVars = []string{"apiVersion", "kind", "metadata", "spec", "status"}
+
+// value checks a value by how it is written (resolver.Check): a template
+// parses and calls functions with the right number of arguments, a CEL
+// expression compiles against vars (nil: syntax only), so it fails here
+// rather than mid-run.
+func (c checker) value(path, expr string, vars []string) {
+	if expr == "" {
+		return
+	}
+	if err := resolver.Check(expr, c.funcs, vars); err != nil {
+		c.err(path, "%v", err)
+	}
+}
+
+// checkValues checks every field move's values. Their data is the spec's
+// top-level fields and value, the old value: known from the source schema
+// when it lists its fields, otherwise CEL is checked for syntax only.
+func checkValues(c checker, spec map[string]Field, fromSpec *apiextensions.JSONSchemaProps, fromOK bool) {
+	var vars []string
+	if fromOK && fromSpec != nil && len(fromSpec.Properties) > 0 &&
+		(fromSpec.XPreserveUnknownFields == nil || !*fromSpec.XPreserveUnknownFields) {
+		vars = []string{"value"}
+		for p := range fromSpec.Properties {
+			vars = append(vars, p)
+		}
+		sort.Strings(vars)
+	}
+	keys := make([]string, 0, len(spec))
+	for k := range spec {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		fl := spec[key]
+		at := "spec." + key
+		c.value(at+".value", fl.Value, vars)
+		for _, p := range sortedStringKeys(fl.Values) {
+			c.value(at+".values."+p, fl.Values[p], vars)
+		}
+	}
+}
+
+func sortedStringKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func checkSelection(c checker, s Selection) {
@@ -236,6 +388,12 @@ func checkSelection(c checker, s Selection) {
 func checkMetadata(c checker, m *Metadata) {
 	if m == nil {
 		return
+	}
+	for _, k := range sortedStringKeys(m.Labels) {
+		c.value("to.metadata.labels."+k, m.Labels[k], objectVars)
+	}
+	for _, k := range sortedStringKeys(m.Annotations) {
+		c.value("to.metadata.annotations."+k, m.Annotations[k], objectVars)
 	}
 	if err := kube.ValidateAnnotationKeys(m.Labels); err != nil {
 		c.err("to.metadata.labels", "%v", err)

@@ -10,21 +10,37 @@ import (
 	"github.com/intentd/kome/engine"
 )
 
-// clean removes the record without touching spec. The timestamp is shared
-// with kind moves; it stays while a kind record needs it.
+// clean removes this migration's entries from the record without touching
+// spec; other migrations' entries stay. The annotation goes with the last
+// entry, and the timestamp, shared with kind moves, while no kind record
+// needs it.
 func (mg migrator) clean(ctx context.Context, obj *unstructured.Unstructured, resource dynamic.NamespaceableResourceInterface) ([]string, error) {
 	a := obj.GetAnnotations()
-	_, hasField := a[mg.Annotations.FieldSnapshot]
-	_, hasKind := a[mg.Annotations.KindSnapshot]
-	_, hasTime := a[mg.Annotations.Timestamp]
-	if !hasField && (!hasTime || hasKind) {
+	if a[mg.Annotations.FieldSnapshot] == "" {
 		return nil, nil
 	}
-	remove := map[string]any{mg.Annotations.FieldSnapshot: nil}
-	if !hasKind {
-		remove[mg.Annotations.Timestamp] = nil
+	all, mine, err := mg.record(obj)
+	if err != nil {
+		return nil, err
 	}
-	patch := map[string]any{"apiVersion": obj.GetAPIVersion(), "kind": obj.GetKind(), "metadata": engine.Meta(obj, remove, false)}
+	if len(mine) == 0 {
+		return nil, nil
+	}
+	_, hasKind := a[mg.Annotations.KindSnapshot]
+	change := map[string]any{}
+	if rest := mg.withMine(all, nil); len(rest) > 0 {
+		encoded, err := engine.EncodeRecord(rest, mg.Annotations.FieldSnapshot, a)
+		if err != nil {
+			return nil, err
+		}
+		change[mg.Annotations.FieldSnapshot] = encoded
+	} else {
+		change[mg.Annotations.FieldSnapshot] = nil
+		if !hasKind {
+			change[mg.Annotations.Timestamp] = nil
+		}
+	}
+	patch := map[string]any{"apiVersion": obj.GetAPIVersion(), "kind": obj.GetKind(), "metadata": engine.Meta(obj, change, false)}
 	if err := mg.Patch(ctx, resource, obj, patch); err != nil {
 		return []string{"annotations"}, fmt.Errorf("remove the record: %w", err)
 	}

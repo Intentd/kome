@@ -78,8 +78,8 @@ migrations:
         value: '{{ printf "%ds" .value }}'
       schedule:                          # fanout: one value, several paths
         values:
-          schedule.minute: '{{ cronMinute .value }}'
-          schedule.hour:   '{{ cronHour .value }}'
+          schedule.minute: '{{ cronMinute .value }}'         # a template: text
+          schedule.daily:  '${ value.endsWith("* * *") }'    # CEL: a boolean
 
   # Kind level: objects move to another kind.
   appconfig:
@@ -92,12 +92,41 @@ migrations:
     selection:
       namespaces: [default, staging]
       selector: tier=web
-    prune: true
+    lifecycle:
+      prune: true                       # delete each source once its destination holds every field
+      children: reparent                # what it owns: reparent | orphan | delete
+      finalizers: [example.io/cleanup]  # the only finalizers KOME may remove first
 ```
 
 A migration with `spec` moves is field level and needs the same kind on both sides. One without is kind level and needs a different kind, group or scope. Schemas are CRD manifest files. `objects` are optionl files of objects in that shape: `validate` checks them, and `rehearse` seeds them.
 
-Templates are Go templates with the [KEL](https://github.com/intentd/kel) functions. `.value` is the old value, and the object's `spec` is the data.
+Values support Go templates (`{{ … }}`) and CEL (`${ … }`), both with the [KEL](https://github.com/intentd/kel) functions. A template writes text; CEL keeps the type (`'${ value * 2 }'` writes a number). Anything else is written as is.
+
+### Order: `needs`
+
+A migration can name the ones that must be done first, as in GitHub Actions:
+
+```yaml
+  v3-timeout:
+    needs: [v2-scaling]
+```
+
+Migrations run in that order (name order where `needs` leaves a choice), and `validate` rejects a cycle or an unknown name. `up` refuses while a migration it needs, and is not part of the run, is still pending; `down` undoes the latest first and refuses while one that needs it is still applied. Where the cluster stands is read from the objects, not from a history table: `kome status` shows each migration's pending, migrated and drifted objects. Field records are keyed by migration, so two migrations moving the same value (a → b, then b → c) are undone one step at a time, and the transitional schema of a migration covers the field migrations of the same kind it needs.
+
+### Field managers and other writers
+
+KOME's writes carry the field manager `kome`, or the migration's `fieldManager:` when the file declares one (an operator's, so the changes are attributed to it). Under a declared manager KOME creates and patches but never server-side applies: applying as an operator would make that operator's next apply remove what KOME wrote. The record keeps the manager, so `down` undoes the move as the one that made it. `--field-manager` overrides both.
+
+Each run reports who else writes what it moves, from the objects' `managedFields`: a GitOps tool or Helm release still writing the old shape will put it back, so it has to change too.
+
+### Pruning
+
+Deleting a source would also delete everything it owns (garbage collection follows `ownerReferences`), and a finalizer can hold the delete forever. So a prune is planned before anything is written, and refused unless the file says what to do:
+
+- **Children.** A source that owns objects is pruned only with `lifecycle.children`: `reparent` points them at the destination first (a namespaced destination can own only objects in its own namespace), `orphan` keeps them without that owner, `delete` lets them go with the source.
+- **Finalizers.** KOME removes only those listed in `lifecycle.finalizers`, then deletes. A source with any other finalizer is not pruned. A finalizer usually means the old controller cleans something up on delete; the destination now owns that something, so the cleanup must not run. Kubernetes' own finalizers can't be listed.
+
+`up --dry-run` names the children and finalizers that stand in the way, and the lines to add. `down` recreates the source, puts the removed finalizers back, points the reparented children at it, and only then deletes the destination: a child left pointing at a deleted owner would be garbage-collected.
 
 ## Principles
 
@@ -106,7 +135,7 @@ Templates are Go templates with the [KEL](https://github.com/intentd/kel) functi
 3. **Nothing is lost on a refusal.** A drifted field keeps its record, a drifted destination keeps its source, and a source is pruned only when its destination holds every source field.
 4. **Safe by default.** KOME generates the transitional schema people don't know they need, refuses to write a path the live schema would drop, and asks before pruning.
 5. **Narrow, never widen.** The file scopes a migration. Flags can narrow that scope but never widen it.
-6. **Honest results.** Each object ends in exactly one stated outcome: migrated, skipped, excluded, drifted, pruned, kept or failed. Every command has JSON output.
+6. **Honest results.** Each object ends in exactly one stated outcome: migrated, skipped, excluded, drifted, pruned, kept, too-large or failed. Every command has JSON output.
 7. **The CLI is the version.** The file carries no version; the KOME release you run defines what it means.
 
 ## Commands
@@ -118,6 +147,7 @@ Templates are Go templates with the [KEL](https://github.com/intentd/kel) functi
 | `kome up` | Checks the live schema, then migrates the selected objects. Asks before pruning; `--yes` skips the question. |
 | `kome down` | Restores migrated objects from their records, leaving drift alone. |
 | `kome clean` | Removes the records. The migration becomes final. |
+| `kome status` | Shows, per migration, how many objects are pending, migrated and drifted, and what it needs. |
 | `kome rehearse` | Runs every migration from start to end in a throwaway cluster. |
 | `kome version` | Prints the version. |
 
@@ -170,11 +200,11 @@ Each migrated object carries annotations under KOME's prefix (`kome.intentd.io`)
 
 | Annotation | On | Holds |
 | --- | --- | --- |
-| `migrate-field-snapshot` | The migrated object | Each field move's values before and after |
-| `migrate-kind-snapshot` | The destination | The source's identity, metadata, spec and status; whether it was pruned; whether the destination existed before |
+| `migrate-field-snapshot` | The migrated object | Each field migration's moves, by migration: the values before and after, and the field manager |
+| `migrate-kind-snapshot` | The destination | The source's identity, metadata, spec and status; whether it was pruned; whether the destination existed before; the children it reparented and the finalizers it removed |
 | `migrate-timestamp` | Both | When the last migration ran |
 
-A record is JSON, readable with `kubectl get -o yaml`. Kubernetes caps an object's annotations at 256 KiB, keys and values together, so a record that would not fit as JSON is written gzip-compressed, in base64. An object without room for its record even then is not migrated: `up` reports it, a dry run included, and `kome rehearse` lists it as a known issue.
+A record is JSON, readable with `kubectl get -o yaml`. Kubernetes caps an object's annotations at 256 KiB, keys and values together, so a record that would not fit as JSON is written gzip-compressed, in base64. An object without room for its record even then is not migrated: KOME never migrates what it can't take back. `up` reports it as `too-large`, a dry run included, and `kome rehearse` lists it as a known issue.
 
 ## As a library
 
@@ -183,12 +213,11 @@ f, _ := declaration.Load("kome.yaml")
 if err := f.Validate().Err(); err != nil { … }
 ms, _ := kome.FromFile(f)
 
-kube, _ := cluster.LocalClient(ctx, "") // tools/cluster; "" is the current context
-e := &kome.Engine{Kube: kube}
-results, err := e.Up(ctx, ms, kome.Options{DryRun: true})
+kube, err := kome.KubeForConfig(cfg, nil) // or a controller's mgr.GetRESTMapper()
+results, err := (&kome.Engine{Kube: kube}).Up(ctx, ms, kome.Options{DryRun: true})
 ```
 
-`Engine.Kube` is tools' [`kubeclient.Interface`](https://pkg.go.dev/github.com/intentd/tools/kubeclient), not client-go's `kubernetes.Interface`: the engine reads and writes any custom resource through the dynamic client and resolves kinds and scopes through the REST mapper, which the typed clientset alone does not offer.
+`KubeForConfig` builds client-go's dynamic and discovery clients from the `rest.Config`. A nil mapper gets one that rediscovers kinds it doesn't know, so a CRD installed during a run is found; a controller passes its own.
 
 `Engine` takes the annotation prefix, the field manager and the template functions as parameters, and a `Transformer` for callers that already apply the same transforms elsewhere. That is how [Inrun](https://inrun.dev) runs its migrations through KOME: it uses its own prefix (`inrun.dev`) and the functions its gateway uses, so live writes and the backfill always agree. The engine does not log; what it met is in its results.
 
@@ -200,7 +229,8 @@ results, err := e.Up(ctx, ms, kome.Options{DryRun: true})
 | `transitional` | Generating the transitional schema |
 | `rehearse` | The rehearsal sequences |
 | `report` | JSON and text reports |
-| `cmd/kome` | The CLI |
+| `cli` | The CLI: `cli.Command()` is the root command |
+| `cmd/kome` | Runs it |
 
 ## Building
 

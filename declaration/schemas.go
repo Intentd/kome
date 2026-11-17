@@ -26,6 +26,7 @@ func (f *File) checkSchemas(c checker, m Migration, from, to Identity) {
 			}
 		}
 	case LevelField:
+		checkValues(c, m.Spec, fromSpec, fromOK)
 		f.checkFieldPaths(c, m, fromSpec, fromOK, toSpec, toOK)
 		if m.Transitional != nil {
 			f.checkTransitional(c, m, fromSpec, fromOK, toSpec, toOK)

@@ -42,9 +42,9 @@ func (mg *migrator) writeStatus(ctx context.Context, ri dynamic.ResourceInterfac
 	}
 	u := obj.DeepCopy()
 	u.Object["status"] = runtime.DeepCopyJSONValue(status)
-	_, err := ri.UpdateStatus(ctx, u, metav1.UpdateOptions{})
+	_, err := ri.UpdateStatus(ctx, u, metav1.UpdateOptions{FieldManager: mg.FieldManager})
 	if apierrors.IsNotFound(err) {
-		_, err = ri.Update(ctx, u, metav1.UpdateOptions{})
+		_, err = ri.Update(ctx, u, metav1.UpdateOptions{FieldManager: mg.FieldManager})
 	}
 	return err
 }

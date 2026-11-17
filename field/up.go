@@ -21,7 +21,7 @@ func (mg migrator) up(ctx context.Context, obj *unstructured.Unstructured, resou
 	if spec == nil {
 		spec = map[string]any{}
 	}
-	record, err := mg.record(obj)
+	all, record, err := mg.record(obj)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -43,7 +43,7 @@ func (mg migrator) up(ctx context.Context, obj *unstructured.Unstructured, resou
 			_ = structured.SetNestedPath(spec, m.From, nil)
 		}
 		migrated = append(migrated, m)
-		entries[m.From] = snapshotEntry(spec, m, old)
+		entries[m.From] = snapshotEntry(spec, m, old, mg.FieldManager)
 	}
 	if len(migrated) == 0 {
 		return nil, nil, nil
@@ -60,7 +60,7 @@ func (mg migrator) up(ctx context.Context, obj *unstructured.Unstructured, resou
 		ann[k] = v
 	}
 	ann[mg.Annotations.Timestamp] = now
-	encoded, err := engine.EncodeRecord(record, mg.Annotations.FieldSnapshot, ann)
+	encoded, err := engine.EncodeRecord(mg.withMine(all, record), mg.Annotations.FieldSnapshot, ann)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -104,7 +104,7 @@ func pending(spec map[string]any, m Move, record map[string]any) (any, bool) {
 
 // snapshotEntry is the record of one move: the before and after values of
 // every path it touched, as flat maps (nil: absent).
-func snapshotEntry(spec map[string]any, m Move, old any) map[string]any {
+func snapshotEntry(spec map[string]any, m Move, old any, fieldManager string) map[string]any {
 	before := map[string]any{m.From: old}
 	after := map[string]any{}
 	for _, dst := range m.Destinations() {
@@ -117,7 +117,7 @@ func snapshotEntry(spec map[string]any, m Move, old any) map[string]any {
 	if _, written := after[m.From]; !written {
 		after[m.From] = nil
 	}
-	return map[string]any{"before": before, "after": after}
+	return map[string]any{"before": before, "after": after, "fieldManager": fieldManager}
 }
 
 // sparse is the spec of the merge patch: each migrated move's destinations,
